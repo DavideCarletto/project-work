@@ -5,8 +5,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 import networkx as nx
 
-from icecream import ic
-
 class Problem:
     _graph: nx.Graph
     _alpha: float
@@ -69,6 +67,7 @@ class Problem:
                 f"dummy_solution: go to {dest} ({' > '.join(str(n) for n in path)} ({cost})"
             )
             total_cost += cost
+
         return total_cost
 
     def plot(self):
