@@ -42,6 +42,3 @@ def get_baseline_path(problem: Problem):
         total_path.extend([(0, 0), (dest, gold_dest), (0, 0)])
     
     return total_path
-
-def compute_path_heavy_cities(p: Problem, target_city, gold):
-    return [(0, 0), (target_city, gold), (0, 0)]
