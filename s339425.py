@@ -16,12 +16,40 @@ def solution(problem):
     golds = np.array([graph.nodes[n]['gold'] for n in nodes])
     pos_map = {n: np.array(graph.nodes[n]['pos']) for n in [0] + nodes}
     
-    # Distances from bases
+    # Distances and shortest paths from base
     try:
-        base_lengths = nx.single_source_dijkstra_path_length(graph, 0, weight='dist')
+        base_lengths, base_paths = nx.single_source_dijkstra(graph, 0, weight='dist')
         d_0 = np.array([base_lengths[n] for n in nodes])
     except:
         d_0 = np.array([nx.shortest_path_length(graph, 0, n, weight='dist') for n in nodes])
+        base_paths = {n: nx.shortest_path(graph, 0, n, weight='dist') for n in [0] + nodes}
+
+    # Cache for inter-city shortest paths
+    _sp_cache = {}
+
+    def get_shortest_path(src, dst):
+        """Get shortest path using pre-computed base paths or cached on-demand."""
+        if src == 0:
+            return base_paths.get(dst, [0, dst])
+        if dst == 0:
+            return list(reversed(base_paths.get(src, [0, src])))
+        key = (src, dst)
+        if key not in _sp_cache:
+            try:
+                _sp_cache[key] = nx.shortest_path(graph, src, dst, weight='dist')
+            except:
+                _sp_cache[key] = [src, dst]
+        return _sp_cache[key]
+
+    def build_leg(src, dst, gold_at_dst):
+        """Build path from src to dst using only direct edges.
+        Returns [(intermediate1, 0), ..., (dst, gold_at_dst)] (nodes after src)."""
+        if src == dst:
+            return [(dst, gold_at_dst)] if gold_at_dst > 0 else []
+        sp = get_shortest_path(src, dst)
+        result = [(node, 0) for node in sp[1:-1]]
+        result.append((dst, gold_at_dst))
+        return result
 
     # If alpha = 0, pure TSP.
     force_tsp = (alpha <= 1e-6)
@@ -29,7 +57,7 @@ def solution(problem):
     # First strategy with hight beat (>= 1.5)
     # Like baseline but we take only a portion of the gold instead of taking all of it
     if beta >= 1.5 and not force_tsp:
-        final_path = [(0, 0)]
+        final_path = []
         indices = np.argsort(d_0) 
         
         for i in indices:
@@ -72,12 +100,19 @@ def solution(problem):
             portion = total_gold / best_k
             remaining = total_gold
             
-            # append to the final path
+            # Use pre-computed base_paths directly (avoids repeated shortest_path calls)
+            path_out = base_paths.get(real_node, [0, real_node])
+            path_ret = list(reversed(path_out))
             for _ in range(best_k):
                 if remaining <= 1e-6: break
                 take = min(portion, remaining)
+                # Outbound: base -> city (gold only at destination)
+                for node in path_out[1:-1]:
+                    final_path.append((node, 0))
                 final_path.append((real_node, take))
-                final_path.append((0, 0))
+                # Return: city -> base (no gold pickup)
+                for node in path_ret[1:]:
+                    final_path.append((node, 0))
                 remaining -= take
                 
         return final_path
@@ -102,60 +137,105 @@ def solution(problem):
         coords_all = np.array([pos_map[n] for n in nodes])
         # compute euclidean distance for each pair of cities
         d_mat = cdist(coords_all, coords_all, metric='euclidean')
-        # if N is small, we can compute the real shortest path on the graph, otherwise we rely in d_mat which we can compute it instantly
-        use_real_dist = (num_targets < 300)
 
-        for i in range(num_targets):
-            for j in range(i + 1, num_targets):
+        # For large N, restrict to K nearest Euclidean neighbors but use REAL graph distances
+        if num_targets >= 300:
+            K = 50
+            # Pre-compute real shortest path lengths from each node (on-demand with budget)
+            _dist_cache = {}
+            time_budget = 200  # seconds
+            for i in range(num_targets):
+                if time.time() - start_time > time_budget: break
                 u = nodes[i]
-                v = nodes[j]
-                
-                if use_real_dist:
+                # K nearest neighbors by Euclidean distance
+                neighbors_idx = np.argsort(d_mat[i])[:K+1]
+                for j in neighbors_idx:
+                    if j == i: continue
+                    v = nodes[j]
+                    key = (u, v) if u < v else (v, u)
+                    if key not in _dist_cache:
+                        try:
+                            _dist_cache[key] = nx.shortest_path_length(graph, u, v, weight='dist')
+                        except:
+                            _dist_cache[key] = d_mat[i, j]
+
+            for i in range(num_targets):
+                u = nodes[i]
+                neighbors_idx = np.argsort(d_mat[i])[:K+1]
+                for j in neighbors_idx:
+                    if j <= i or j == i: continue
+                    v = nodes[j]
+                    key = (u, v) if u < v else (v, u)
+                    d_uv = _dist_cache.get(key, d_mat[i, j])
+
+                    d_0u = d_0[i]
+                    d_0v = d_0[j]
+                    g_u = golds[i]
+                    g_v = golds[j]
+
+                    cost_leg_uv = d_uv + (d_uv * alpha * g_u)**beta
+                    cost_leg_vu = d_uv + (d_uv * alpha * g_v)**beta
+
+                    base_out_cost = (d_0u * alpha * 0)**beta
+                    base_in_term_u = (d_0v * alpha * (g_u + g_v))**beta
+                    base_in_term_v = (d_0u * alpha * (g_v + g_u))**beta
+
+                    cost_merged_uv = (d_0u + base_out_cost) + cost_leg_uv + (d_0v + base_in_term_u)
+                    sav_uv = (star_costs[u] + star_costs[v]) - cost_merged_uv
+
+                    cost_merged_vu = (d_0v + base_out_cost) + cost_leg_vu + (d_0u + base_in_term_v)
+                    sav_vu = (star_costs[u] + star_costs[v]) - cost_merged_vu
+
+                    if sav_uv > 1e-9:
+                        savings.append((sav_uv, u, v, 'uv'))
+                    if sav_vu > 1e-9:
+                        savings.append((sav_vu, v, u, 'vu'))
+        else:
+            # N is small: compute all pairs with real shortest paths
+            for i in range(num_targets):
+                for j in range(i + 1, num_targets):
+                    u = nodes[i]
+                    v = nodes[j]
+
                     try:
-                        # if N is small we can directly compute it with nx.shortest_path
                         d_uv = nx.shortest_path_length(graph, u, v, weight='dist')
                     except:
-                        # otherwise, we rely on euclidean distance
                         d_uv = d_mat[i, j]
-                else:
-                    d_uv = d_mat[i, j]
 
-                d_0u = d_0[i]
-                d_0v = d_0[j]
-                g_u = golds[i]
-                g_v = golds[j]
-                
-                # Compute the cost to go from u to v
-                cost_leg_uv = d_uv + (d_uv * alpha * g_u)**beta
-                
-                # Compute the cost to go from v to u
-                cost_leg_vu = d_uv + (d_uv * alpha * g_v)**beta
+                    d_0u = d_0[i]
+                    d_0v = d_0[j]
+                    g_u = golds[i]
+                    g_v = golds[j]
+                    
+                    # Compute the cost to go from u to v
+                    cost_leg_uv = d_uv + (d_uv * alpha * g_u)**beta
+                    
+                    # Compute the cost to go from v to u
+                    cost_leg_vu = d_uv + (d_uv * alpha * g_v)**beta
 
-                # Compute the cost to go base -> u -> base -> v
-                base_out_cost = (d_0u * alpha * 0)**beta
-                base_in_term_u = (d_0v * alpha * (g_u + g_v))**beta
-                base_in_term_v = (d_0u * alpha * (g_v + g_u))**beta
-                
-                # First option: base -> u -> v -> base
-                # cost = (d_0u + out_term) + cost_leg_uv + (d_0v + in_term)
-                cost_merged_uv = (d_0u + base_out_cost) + \
-                                 cost_leg_uv + \
-                                 (d_0v + base_in_term_u)
-                
-                # Saving if we merge the cities instead of doing like baseline
-                sav_uv = (star_costs[u] + star_costs[v]) - cost_merged_uv
-                
-                # Second option: base -> v -> u -> base
-                cost_merged_vu = (d_0v + base_out_cost) + \
-                                 cost_leg_vu + \
-                                 (d_0u + base_in_term_v)
-                           
-                sav_vu = (star_costs[u] + star_costs[v]) - cost_merged_vu
-                
-                if sav_uv > 1e-9:
-                    savings.append((sav_uv, u, v, 'uv')) 
-                if sav_vu > 1e-9:
-                    savings.append((sav_vu, v, u, 'vu'))
+                    # Compute the cost to go base -> u -> base -> v
+                    base_out_cost = (d_0u * alpha * 0)**beta
+                    base_in_term_u = (d_0v * alpha * (g_u + g_v))**beta
+                    base_in_term_v = (d_0u * alpha * (g_v + g_u))**beta
+                    
+                    # First option: base -> u -> v -> base
+                    cost_merged_uv = (d_0u + base_out_cost) + \
+                                     cost_leg_uv + \
+                                     (d_0v + base_in_term_u)
+                    
+                    sav_uv = (star_costs[u] + star_costs[v]) - cost_merged_uv
+                    
+                    # Second option: base -> v -> u -> base
+                    cost_merged_vu = (d_0v + base_out_cost) + \
+                                     cost_leg_vu + \
+                                     (d_0u + base_in_term_v)
+                               
+                    sav_vu = (star_costs[u] + star_costs[v]) - cost_merged_vu
+                    
+                    if sav_uv > 1e-9:
+                        savings.append((sav_uv, u, v, 'uv')) 
+                    if sav_vu > 1e-9:
+                        savings.append((sav_vu, v, u, 'vu'))
 
         # we save all the savings into a list and order it from the highest to the lowest
         savings.sort(key=lambda x: x[0], reverse=True)
@@ -184,11 +264,11 @@ def solution(problem):
                     curr = next_node[curr]
                     
         # 4. Build the final path based on the merging
-        final_path = [(0, 0)]
+        final_path = []
         # Identifying the heads of the merged paths
         start_nodes = [n for n in nodes if prev_node[n] is None]
         
-        # Going thgrough all the different paths we created and translate in the correct format
+        # Build paths using direct edges
         for start_n in start_nodes:
             chain = []
             curr = start_n
@@ -196,9 +276,12 @@ def solution(problem):
                 chain.append(curr)
                 curr = next_node[curr]
             
-            # Base -> Chain -> Base
+            # Base -> chain[0] -> chain[1] -> ... -> chain[-1] -> Base
+            prev = 0
             for node in chain:
-                final_path.append((node, golds[node_to_id[node]]))
-            final_path.append((0, 0))
-
+                final_path.extend(build_leg(prev, node, golds[node_to_id[node]]))
+                prev = node
+            # Return to base
+            final_path.extend(build_leg(prev, 0, 0))
+            
         return final_path
