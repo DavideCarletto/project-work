@@ -96,7 +96,7 @@ When a merge happens, we update the route identifiers so that all nodes in the a
 
 #### Step 4: Path Construction
 
-After merging, we reconstruct the final path by identifying route heads (nodes with no predecessor) and following the chain of `next_node` pointers:
+After merging, we reconstruct the final path by identifying route heads (nodes with no predecessor) and following the chain of `next_node` pointers. Since two consecutive cities in a chain may not share a direct edge in the graph, we use a helper function `build_leg` that expands each hop into the actual shortest path between the two cities, inserting intermediate nodes as needed:
 
 ```python
 start_nodes = [n for n in nodes if prev_node[n] is None]
@@ -107,10 +107,26 @@ for start_n in start_nodes:
     while curr is not None:
         chain.append(curr)
         curr = next_node[curr]
-    # base -> chain -> base
+    # base -> chain[0] -> ... -> chain[-1] -> base
+    prev = 0
+    for node in chain:
+        final_path.extend(build_leg(prev, node, golds[node_to_id[node]]))
+        prev = node
+    final_path.extend(build_leg(prev, 0, 0))
 ```
 
+`build_leg(src, dst, gold)` computes the shortest path from `src` to `dst` and returns the sequence of intermediate nodes (with no gold pickup) followed by the destination node (with the specified gold pickup). This guarantees that every consecutive pair of nodes in the final path is connected by a direct edge in the graph.
+
 Each chain becomes a trip: the thief leaves the base, visits all cities in the chain collecting their gold, and returns to the base before starting the next chain.
+
+#### Step 5: Local Search Validation
+
+The greedy merging can sometimes produce chains where the accumulated gold weight makes the route more expensive than serving each city individually (especially for `beta = 1` with large instances). To fix this, after building each chain we compare its real cost (with weight accumulation) against the sum of the individual star-route costs:
+
+- If the merged chain is cheaper, we keep it as-is.
+- If the merged chain is worse, we try all possible split points to divide it into two shorter sub-chains. If no split improves the cost, we fall back to individual star routes for each city in the chain.
+
+This ensures the solution never degrades below the baseline.
 
 ### Distance Precomputation
 

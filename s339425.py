@@ -140,7 +140,7 @@ def solution(problem):
 
         # For large N, restrict to K nearest Euclidean neighbors but use REAL graph distances
         if num_targets >= 300:
-            K = 50
+            K = 150
             # Pre-compute real shortest path lengths from each node (on-demand with budget)
             _dist_cache = {}
             time_budget = 200  # seconds
@@ -268,20 +268,80 @@ def solution(problem):
         # Identifying the heads of the merged paths
         start_nodes = [n for n in nodes if prev_node[n] is None]
         
-        # Build paths using direct edges
+        def chain_cost(chain):
+            """Compute actual cost of a chain route: base -> chain -> base with weight accumulation."""
+            cost = 0.0
+            w = 0.0
+            prev_n = 0
+            for nd in chain:
+                sp = get_shortest_path(prev_n, nd)
+                for k in range(len(sp) - 1):
+                    d = graph[sp[k]][sp[k+1]]['dist']
+                    cost += d if w < 1e-9 else d + (d * alpha * w)**beta
+                w += golds[node_to_id[nd]]
+                prev_n = nd
+            # Return to base
+            sp = get_shortest_path(prev_n, 0)
+            for k in range(len(sp) - 1):
+                d = graph[sp[k]][sp[k+1]]['dist']
+                cost += d if w < 1e-9 else d + (d * alpha * w)**beta
+            return cost
+
+        def build_star_path(city):
+            """Build baseline star route for a single city: base -> city -> base."""
+            path = []
+            path.extend(build_leg(0, city, golds[node_to_id[city]]))
+            path.extend(build_leg(city, 0, 0))
+            return path
+
+        # Build paths using direct edges, with local search validation
         for start_n in start_nodes:
             chain = []
             curr = start_n
             while curr is not None:
                 chain.append(curr)
                 curr = next_node[curr]
-            
-            # Base -> chain[0] -> chain[1] -> ... -> chain[-1] -> Base
-            prev = 0
-            for node in chain:
-                final_path.extend(build_leg(prev, node, golds[node_to_id[node]]))
-                prev = node
-            # Return to base
-            final_path.extend(build_leg(prev, 0, 0))
+
+            # Local search: compare chain cost vs sum of individual star routes
+            merged_cost = chain_cost(chain)
+            star_total = sum(star_costs[n] for n in chain)
+
+            if merged_cost <= star_total:
+                # Merged route is better, use it
+                prev = 0
+                for node in chain:
+                    final_path.extend(build_leg(prev, node, golds[node_to_id[node]]))
+                    prev = node
+                final_path.extend(build_leg(prev, 0, 0))
+            else:
+                # Chain is worse than baseline: try splitting into smaller sub-chains
+                best_path = []
+                for c in chain:
+                    best_path.extend(build_star_path(c))
+                best_cost = star_total
+
+                # Try all possible split points to find the best 2-partition
+                if len(chain) > 1 and time.time() - start_time < 280:
+                    for split in range(1, len(chain)):
+                        left = chain[:split]
+                        right = chain[split:]
+                        split_cost = chain_cost(left) + chain_cost(right)
+                        if split_cost < best_cost:
+                            best_cost = split_cost
+                            best_path = []
+                            # Build left sub-chain
+                            prev = 0
+                            for node in left:
+                                best_path.extend(build_leg(prev, node, golds[node_to_id[node]]))
+                                prev = node
+                            best_path.extend(build_leg(prev, 0, 0))
+                            # Build right sub-chain
+                            prev = 0
+                            for node in right:
+                                best_path.extend(build_leg(prev, node, golds[node_to_id[node]]))
+                                prev = node
+                            best_path.extend(build_leg(prev, 0, 0))
+
+                final_path.extend(best_path)
             
         return final_path
